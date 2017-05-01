@@ -4,7 +4,7 @@
 
 // +build race
 
-package http
+package goHTTPtest
 
 func init() {
 	raceEnabled = true

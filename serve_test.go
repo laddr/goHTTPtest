@@ -4,7 +4,7 @@
 
 // End-to-end serving tests
 
-package http_test
+package goHTTPtest_test
 
 import (
 	"bufio"
