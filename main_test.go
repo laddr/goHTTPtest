@@ -1,204 +1,157 @@
-// Copyright 2015 The Go Authors. All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package net
+package http_test
 
 import (
-	"flag"
 	"fmt"
-	"net/internal/socktest"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 )
 
-var (
-	sw socktest.Switch
-
-	// uninstallTestHooks runs just before a run of benchmarks.
-	testHookUninstaller sync.Once
-)
-
-var (
-	testTCPBig = flag.Bool("tcpbig", false, "whether to test massive size of data per read or write call on TCP connection")
-
-	testDNSFlood = flag.Bool("dnsflood", false, "whether to test DNS query flooding")
-
-	// If external IPv4 connectivity exists, we can try dialing
-	// non-node/interface local scope IPv4 addresses.
-	// On Windows, Lookup APIs may not return IPv4-related
-	// resource records when a node has no external IPv4
-	// connectivity.
-	testIPv4 = flag.Bool("ipv4", true, "assume external IPv4 connectivity exists")
-
-	// If external IPv6 connectivity exists, we can try dialing
-	// non-node/interface local scope IPv6 addresses.
-	// On Windows, Lookup APIs may not return IPv6-related
-	// resource records when a node has no external IPv6
-	// connectivity.
-	testIPv6 = flag.Bool("ipv6", false, "assume external IPv6 connectivity exists")
-)
+var quietLog = log.New(ioutil.Discard, "", 0)
 
 func TestMain(m *testing.M) {
-	setupTestData()
-	installTestHooks()
-
-	st := m.Run()
-
-	testHookUninstaller.Do(uninstallTestHooks)
-	if testing.Verbose() {
-		printRunningGoroutines()
-		printInflightSockets()
-		printSocketStats()
+	v := m.Run()
+	if v == 0 && goroutineLeaked() {
+		os.Exit(1)
 	}
-	forceCloseSockets()
-	os.Exit(st)
+	os.Exit(v)
 }
 
-type ipv6LinkLocalUnicastTest struct {
-	network, address string
-	nameLookup       bool
-}
-
-var (
-	ipv6LinkLocalUnicastTCPTests []ipv6LinkLocalUnicastTest
-	ipv6LinkLocalUnicastUDPTests []ipv6LinkLocalUnicastTest
-)
-
-func setupTestData() {
-	if supportsIPv4() {
-		resolveTCPAddrTests = append(resolveTCPAddrTests, []resolveTCPAddrTest{
-			{"tcp", "localhost:1", &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 1}, nil},
-			{"tcp4", "localhost:2", &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 2}, nil},
-		}...)
-		resolveUDPAddrTests = append(resolveUDPAddrTests, []resolveUDPAddrTest{
-			{"udp", "localhost:1", &UDPAddr{IP: IPv4(127, 0, 0, 1), Port: 1}, nil},
-			{"udp4", "localhost:2", &UDPAddr{IP: IPv4(127, 0, 0, 1), Port: 2}, nil},
-		}...)
-		resolveIPAddrTests = append(resolveIPAddrTests, []resolveIPAddrTest{
-			{"ip", "localhost", &IPAddr{IP: IPv4(127, 0, 0, 1)}, nil},
-			{"ip4", "localhost", &IPAddr{IP: IPv4(127, 0, 0, 1)}, nil},
-		}...)
-	}
-
-	if supportsIPv6() {
-		resolveTCPAddrTests = append(resolveTCPAddrTests, resolveTCPAddrTest{"tcp6", "localhost:3", &TCPAddr{IP: IPv6loopback, Port: 3}, nil})
-		resolveUDPAddrTests = append(resolveUDPAddrTests, resolveUDPAddrTest{"udp6", "localhost:3", &UDPAddr{IP: IPv6loopback, Port: 3}, nil})
-		resolveIPAddrTests = append(resolveIPAddrTests, resolveIPAddrTest{"ip6", "localhost", &IPAddr{IP: IPv6loopback}, nil})
-	}
-
-	ifi := loopbackInterface()
-	if ifi != nil {
-		index := fmt.Sprintf("%v", ifi.Index)
-		resolveTCPAddrTests = append(resolveTCPAddrTests, []resolveTCPAddrTest{
-			{"tcp6", "[fe80::1%" + ifi.Name + "]:1", &TCPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneCache.name(ifi.Index)}, nil},
-			{"tcp6", "[fe80::1%" + index + "]:2", &TCPAddr{IP: ParseIP("fe80::1"), Port: 2, Zone: index}, nil},
-		}...)
-		resolveUDPAddrTests = append(resolveUDPAddrTests, []resolveUDPAddrTest{
-			{"udp6", "[fe80::1%" + ifi.Name + "]:1", &UDPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneCache.name(ifi.Index)}, nil},
-			{"udp6", "[fe80::1%" + index + "]:2", &UDPAddr{IP: ParseIP("fe80::1"), Port: 2, Zone: index}, nil},
-		}...)
-		resolveIPAddrTests = append(resolveIPAddrTests, []resolveIPAddrTest{
-			{"ip6", "fe80::1%" + ifi.Name, &IPAddr{IP: ParseIP("fe80::1"), Zone: zoneCache.name(ifi.Index)}, nil},
-			{"ip6", "fe80::1%" + index, &IPAddr{IP: ParseIP("fe80::1"), Zone: index}, nil},
-		}...)
-	}
-
-	addr := ipv6LinkLocalUnicastAddr(ifi)
-	if addr != "" {
-		if runtime.GOOS != "dragonfly" {
-			ipv6LinkLocalUnicastTCPTests = append(ipv6LinkLocalUnicastTCPTests, []ipv6LinkLocalUnicastTest{
-				{"tcp", "[" + addr + "%" + ifi.Name + "]:0", false},
-			}...)
-			ipv6LinkLocalUnicastUDPTests = append(ipv6LinkLocalUnicastUDPTests, []ipv6LinkLocalUnicastTest{
-				{"udp", "[" + addr + "%" + ifi.Name + "]:0", false},
-			}...)
-		}
-		ipv6LinkLocalUnicastTCPTests = append(ipv6LinkLocalUnicastTCPTests, []ipv6LinkLocalUnicastTest{
-			{"tcp6", "[" + addr + "%" + ifi.Name + "]:0", false},
-		}...)
-		ipv6LinkLocalUnicastUDPTests = append(ipv6LinkLocalUnicastUDPTests, []ipv6LinkLocalUnicastTest{
-			{"udp6", "[" + addr + "%" + ifi.Name + "]:0", false},
-		}...)
-		switch runtime.GOOS {
-		case "darwin", "dragonfly", "freebsd", "openbsd", "netbsd":
-			ipv6LinkLocalUnicastTCPTests = append(ipv6LinkLocalUnicastTCPTests, []ipv6LinkLocalUnicastTest{
-				{"tcp", "[localhost%" + ifi.Name + "]:0", true},
-				{"tcp6", "[localhost%" + ifi.Name + "]:0", true},
-			}...)
-			ipv6LinkLocalUnicastUDPTests = append(ipv6LinkLocalUnicastUDPTests, []ipv6LinkLocalUnicastTest{
-				{"udp", "[localhost%" + ifi.Name + "]:0", true},
-				{"udp6", "[localhost%" + ifi.Name + "]:0", true},
-			}...)
-		case "linux":
-			ipv6LinkLocalUnicastTCPTests = append(ipv6LinkLocalUnicastTCPTests, []ipv6LinkLocalUnicastTest{
-				{"tcp", "[ip6-localhost%" + ifi.Name + "]:0", true},
-				{"tcp6", "[ip6-localhost%" + ifi.Name + "]:0", true},
-			}...)
-			ipv6LinkLocalUnicastUDPTests = append(ipv6LinkLocalUnicastUDPTests, []ipv6LinkLocalUnicastTest{
-				{"udp", "[ip6-localhost%" + ifi.Name + "]:0", true},
-				{"udp6", "[ip6-localhost%" + ifi.Name + "]:0", true},
-			}...)
-		}
-	}
-}
-
-func printRunningGoroutines() {
-	gss := runningGoroutines()
-	if len(gss) == 0 {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "Running goroutines:\n")
-	for _, gs := range gss {
-		fmt.Fprintf(os.Stderr, "%v\n", gs)
-	}
-	fmt.Fprintf(os.Stderr, "\n")
-}
-
-// runningGoroutines returns a list of remaining goroutines.
-func runningGoroutines() []string {
-	var gss []string
-	b := make([]byte, 2<<20)
-	b = b[:runtime.Stack(b, true)]
-	for _, s := range strings.Split(string(b), "\n\n") {
-		ss := strings.SplitN(s, "\n", 2)
-		if len(ss) != 2 {
+func interestingGoroutines() (gs []string) {
+	buf := make([]byte, 2<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		sl := strings.SplitN(g, "\n", 2)
+		if len(sl) != 2 {
 			continue
 		}
-		stack := strings.TrimSpace(ss[1])
-		if !strings.Contains(stack, "created by net") {
+		stack := strings.TrimSpace(sl[1])
+		if stack == "" ||
+			strings.Contains(stack, "created by net.startServer") ||
+			strings.Contains(stack, "created by testing.RunTests") ||
+			strings.Contains(stack, "closeWriteAndWait") ||
+			strings.Contains(stack, "testing.Main(") ||
+			// These only show up with GOTRACEBACK=2; Issue 5005 (comment 28)
+			strings.Contains(stack, "runtime.goexit") ||
+			strings.Contains(stack, "created by runtime.gc") ||
+			strings.Contains(stack, "net/http_test.interestingGoroutines") ||
+			strings.Contains(stack, "runtime.MHeap_Scavenger") {
 			continue
 		}
-		gss = append(gss, stack)
+		gs = append(gs, stack)
 	}
-	sort.Strings(gss)
-	return gss
+	sort.Strings(gs)
+	return
 }
 
-func printInflightSockets() {
-	sos := sw.Sockets()
-	if len(sos) == 0 {
-		return
+// Verify the other tests didn't leave any goroutines running.
+func goroutineLeaked() bool {
+	if testing.Short() {
+		// not counting goroutines for leakage in -short mode
+		return false
 	}
-	fmt.Fprintf(os.Stderr, "Inflight sockets:\n")
-	for s, so := range sos {
-		fmt.Fprintf(os.Stderr, "%v: %v\n", s, so)
+
+	var stackCount map[string]int
+	for i := 0; i < 5; i++ {
+		n := 0
+		stackCount = make(map[string]int)
+		gs := interestingGoroutines()
+		for _, g := range gs {
+			stackCount[g]++
+			n++
+		}
+		if n == 0 {
+			return false
+		}
+		// Wait for goroutines to schedule and die off:
+		time.Sleep(100 * time.Millisecond)
 	}
-	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Too many goroutines running after net/http test(s).\n")
+	for stack, count := range stackCount {
+		fmt.Fprintf(os.Stderr, "%d instances of:\n%s\n", count, stack)
+	}
+	return true
 }
 
-func printSocketStats() {
-	sts := sw.Stats()
-	if len(sts) == 0 {
+// setParallel marks t as a parallel test if we're in short mode
+// (all.bash), but as a serial test otherwise. Using t.Parallel isn't
+// compatible with the afterTest func in non-short mode.
+func setParallel(t *testing.T) {
+	if testing.Short() {
+		t.Parallel()
+	}
+}
+
+func afterTest(t testing.TB) {
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+	if testing.Short() {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "Socket statistical information:\n")
-	for _, st := range sts {
-		fmt.Fprintf(os.Stderr, "%v\n", st)
+	var bad string
+	badSubstring := map[string]string{
+		").readLoop(":                                  "a Transport",
+		").writeLoop(":                                 "a Transport",
+		"created by net/http/httptest.(*Server).Start": "an httptest.Server",
+		"timeoutHandler":                               "a TimeoutHandler",
+		"net.(*netFD).connect(":                        "a timing out dial",
+		").noteClientGone(":                            "a closenotifier sender",
 	}
-	fmt.Fprintf(os.Stderr, "\n")
+	var stacks string
+	for i := 0; i < 4; i++ {
+		bad = ""
+		stacks = strings.Join(interestingGoroutines(), "\n\n")
+		for substr, what := range badSubstring {
+			if strings.Contains(stacks, substr) {
+				bad = what
+			}
+		}
+		if bad == "" {
+			return
+		}
+		// Bad stuff found, but goroutines might just still be
+		// shutting down, so give it some time.
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Errorf("Test appears to have leaked %s:\n%s", bad, stacks)
+}
+
+// waitCondition reports whether fn eventually returned true,
+// checking immediately and then every checkEvery amount,
+// until waitFor has elapsed, at which point it returns false.
+func waitCondition(waitFor, checkEvery time.Duration, fn func() bool) bool {
+	deadline := time.Now().Add(waitFor)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return true
+		}
+		time.Sleep(checkEvery)
+	}
+	return false
+}
+
+// waitErrCondition is like waitCondition but with errors instead of bools.
+func waitErrCondition(waitFor, checkEvery time.Duration, fn func() error) error {
+	deadline := time.Now().Add(waitFor)
+	var err error
+	for time.Now().Before(deadline) {
+		if err = fn(); err == nil {
+			return nil
+		}
+		time.Sleep(checkEvery)
+	}
+	return err
+}
+
+func closeClient(c *http.Client) {
+	c.Transport.(*http.Transport).CloseIdleConnections()
 }
